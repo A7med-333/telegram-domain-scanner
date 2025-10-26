@@ -1,1 +1,94 @@
+name: Subdomain & Vulnerability Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Domain to scan'
+        required: true
+        default: 'example.com'
+  schedule:
+    - cron: '0 6 * * 1' # Every Monday at 6 AM UTC
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install Tools
+        run: |
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Validate Secrets
+        run: |
+          if [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] || [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
+            echo "::error::Missing Telegram secrets"
+            exit 1
+          fi
+          echo "BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" >> $GITHUB_ENV
+          echo "CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> $GITHUB_ENV
+
+      - name: Set Domain
+        id: set_domain
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
+          else
+            echo "DOMAIN=example.com" >> $GITHUB_ENV
+          fi
+
+      - name: Notify Start
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ env.BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ env.CHAT_ID }}" \
+          -d text="🚀 *Scan Started*\nTarget: \`${{ env.DOMAIN }}\`\nTriggered by: \`${{ github.actor }}\`" \
+          -d parse_mode="Markdown"
+
+      - name: Run Subfinder
+        run: |
+          subfinder -d ${{ env.DOMAIN }} -silent -o subdomains.txt
+          echo "SUBDOMAINS_FOUND=$(wc -l < subdomains.txt)" >> $GITHUB_ENV
+
+      - name: Notify Subfinder Results
+        run: |
+          COUNT=${{ env.SUBDOMAINS_FOUND }}
+          curl -s -X POST "https://api.telegram.org/bot${{ env.BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ env.CHAT_ID }}" \
+          -d text="✅ *Subfinder Finished*\nDomain: \`${{ env.DOMAIN }}\`\nFound: *$COUNT* subdomains" \
+          -d parse_mode="Markdown"
+
+      - name: Run Nuclei
+        run: |
+          nuclei -l subdomains.txt -severity critical,high,medium -silent -o nuclei-results.txt
+          echo "VULNS_FOUND=$(wc -l < nuclei-results.txt)" >> $GITHUB_ENV
+
+      - name: Notify Nuclei Summary
+        run: |
+          if [ ${{ env.VULNS_FOUND }} -gt 0 ]; then
+            MSG="🚨 *Vulnerabilities Found!* \nCount: *${{ env.VULNS_FOUND }}*"
+          else
+            MSG="✅ *Nuclei Completed*\nNo vulnerabilities found."
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${{ env.BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ env.CHAT_ID }}" \
+          -d text="$MSG" \
+          -d parse_mode="Markdown"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results
+          path: |
+            subdomains.txt
+            nuclei-results.txt
 
